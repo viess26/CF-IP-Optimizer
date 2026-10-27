@@ -1,214 +1,122 @@
-#!/usr/bin/env python3
-import concurrent.futures
-import csv
-import html
-import ipaddress
-import json
-import socket
-import ssl
-import statistics
-import time
-import urllib.request
+import concurrent.futures, csv, html, ipaddress, json, socket, ssl, statistics, time, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-CONFIG = json.loads(Path("config.json").read_text(encoding="utf-8"))
-RANGES_URL = "https://www.cloudflare.com/ips-v4"
-MAX_BYTES = int(CONFIG.get("download_test_bytes", 524288))
+C = json.loads(Path("config.json").read_text(encoding="utf-8"))
+MAX_BYTES = int(C.get("download_test_bytes", 524288))
 
+def get_ranges():
+    req = urllib.request.Request("https://www.cloudflare.com/ips-v4", headers={"User-Agent":"CF-IP-Optimizer/3.0"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        text = r.read().decode()
+    Path("ips-v4.txt").write_text(text, encoding="utf-8")
+    return [ipaddress.ip_network(x.strip()) for x in text.splitlines() if x.strip()]
 
-def fetch_networks():
-    req = urllib.request.Request(
-        RANGES_URL, headers={"User-Agent": "CF-IP-Optimizer/1.0"}
-    )
-    with urllib.request.urlopen(req, timeout=15) as response:
-        content = response.read().decode("utf-8")
-    Path("ips-v4.txt").write_text(content, encoding="utf-8")
-    return [ipaddress.ip_network(line.strip()) for line in content.splitlines()
-            if line.strip()]
+def sample(networks, limit):
+    nets = [n for n in networks if n.version == 4 and n.num_addresses > 2]
+    if not nets or limit <= 0: return []
+    per = max(1, limit // len(nets))
+    out = []
+    for n in nets:
+        count = min(per, n.num_addresses - 2)
+        for i in range(count):
+            offset = 1 + int((i + .5) * (n.num_addresses - 2) / count)
+            out.append(str(n.network_address + offset))
+            if len(out) >= limit: break
+        if len(out) >= limit: break
+    return list(dict.fromkeys(out))[:limit]
 
-
-def sample_ips(networks, limit):
-    """Sample a bounded number of addresses across published IPv4 ranges."""
-    candidates = []
-    usable = [n for n in networks if n.version == 4 and n.num_addresses > 2]
-    if not usable or limit <= 0:
-        return []
-    per_network = max(1, limit // len(usable))
-    for network in usable:
-        count = min(per_network, network.num_addresses - 2)
-        if count == 1:
-            candidates.append(str(network.network_address + network.num_addresses // 2))
-        else:
-            for i in range(count):
-                offset = 1 + int(i * (network.num_addresses - 2) / count)
-                candidates.append(str(network.network_address + offset))
-        if len(candidates) >= limit:
-            break
-    return list(dict.fromkeys(candidates))[:limit]
-
-
-def tcp_once(ip, port, timeout):
-    start = time.perf_counter()
+def tcp(ip):
+    t = time.perf_counter()
     try:
-        with socket.create_connection((ip, port), timeout=timeout):
-            return (time.perf_counter() - start) * 1000, True
+        with socket.create_connection((ip, int(C.get("port",443))), timeout=float(C.get("timeout_seconds",2.5))):
+            return (time.perf_counter()-t)*1000, True
     except OSError:
         return None, False
 
-
-def https_test_ip(ip, host, path, timeout):
-    """Connect to candidate IP while preserving TLS SNI and HTTP Host."""
-    start = time.perf_counter()
-    context = ssl.create_default_context()
+def https(ip):
+    host = str(C.get("test_host","")).strip()
+    if not host: return "", "", ""
+    path = str(C.get("test_path","/")).strip() or "/"
+    t = time.perf_counter()
     try:
-        raw = socket.create_connection((ip, 443), timeout=timeout)
-        with context.wrap_socket(raw, server_hostname=host) as conn:
-            conn.settimeout(timeout)
-            request = (
-                f"GET {path} HTTP/1.1\r\n"
-                f"Host: {host}\r\n"
-                "User-Agent: CF-IP-Optimizer/1.0\r\n"
-                "Connection: close\r\n\r\n"
-            )
-            conn.sendall(request.encode("ascii", errors="ignore"))
-            first = conn.recv(4096)
-            if not first:
-                return "", "", ""
-            header_end = first.find(b"\r\n")
-            status_line = first[:header_end].decode("latin1", errors="replace") if header_end >= 0 else ""
-            pieces = status_line.split(" ")
-            status = pieces[1] if len(pieces) >= 2 else ""
-            received = len(first)
-            body_start = first.find(b"\r\n\r\n")
-            body_bytes = len(first[body_start + 4:]) if body_start >= 0 else 0
-            while received < MAX_BYTES:
-                chunk = conn.recv(min(65536, MAX_BYTES - received))
-                if not chunk:
-                    break
-                received += len(chunk)
-                body_bytes += len(chunk)
-            elapsed = time.perf_counter() - start
-            speed = round((body_bytes / (1024 * 1024)) / elapsed, 3) if elapsed > 0 else 0
-            return status, round(elapsed * 1000, 2), speed
+        raw = socket.create_connection((ip,443), timeout=float(C.get("timeout_seconds",2.5)))
+        with ssl.create_default_context().wrap_socket(raw, server_hostname=host) as s:
+            s.settimeout(float(C.get("timeout_seconds",2.5)))
+            s.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: CF-IP-Optimizer/3.0\r\nConnection: close\r\n\r\n").encode())
+            first = s.recv(4096)
+            if not first: return "", "", ""
+            line = first.split(b"\r\n",1)[0].decode("latin1","replace").split()
+            status = line[1] if len(line)>1 else ""
+            sep = first.find(b"\r\n\r\n")
+            body = len(first[sep+4:]) if sep>=0 else 0
+            total = len(first)
+            while total < MAX_BYTES:
+                chunk = s.recv(min(65536, MAX_BYTES-total))
+                if not chunk: break
+                total += len(chunk); body += len(chunk)
+            elapsed = time.perf_counter()-t
+            return status, round(elapsed*1000,2), round(body/(1024*1024)/elapsed,3) if elapsed else 0
     except (OSError, ssl.SSLError, TimeoutError):
         return "", "", ""
 
-
-def test_ip(ip):
-    port = int(CONFIG.get("port", 443))
-    timeout = float(CONFIG.get("timeout_seconds", 2.5))
-    rounds = max(1, int(CONFIG.get("rounds", 4)))
-    timings = []
+def test(ip):
+    rounds = max(1,int(C.get("rounds",5))); values=[]
     for _ in range(rounds):
-        ms, ok = tcp_once(ip, port, timeout)
-        if ok:
-            timings.append(ms)
-        time.sleep(0.08)
-
-    row = {
-        "ip": ip,
-        "sent": rounds,
-        "received": len(timings),
-        "loss_pct": round((rounds - len(timings)) / rounds * 100, 2),
-        "avg_latency_ms": round(statistics.mean(timings), 2) if timings else "",
-        "median_latency_ms": round(statistics.median(timings), 2) if timings else "",
-        "min_latency_ms": round(min(timings), 2) if timings else "",
-        "download_MB_s": "",
-        "https_status": "",
-        "https_latency_ms": "",
-        "source": "Cloudflare IPv4 range"
-    }
-    host = str(CONFIG.get("test_host", "")).strip()
-    path = str(CONFIG.get("test_path", "/")).strip() or "/"
-    if host:
-        status, latency, speed = https_test_ip(ip, host, path, timeout)
-        row["https_status"] = status
-        row["https_latency_ms"] = latency
-        row["download_MB_s"] = speed
+        ms, ok = tcp(ip)
+        if ok: values.append(ms)
+        time.sleep(.06)
+    row = {"ip":ip,"sent":rounds,"received":len(values),
+           "loss_pct":round((rounds-len(values))*100/rounds,2),
+           "success_rate_pct":round(len(values)*100/rounds,2),
+           "avg_latency_ms":round(statistics.mean(values),2) if values else "",
+           "median_latency_ms":round(statistics.median(values),2) if values else "",
+           "min_latency_ms":round(min(values),2) if values else "",
+           "download_MB_s":"","https_status":"","https_latency_ms":"","score":0,
+           "source":"Cloudflare IPv4 range"}
+    row["https_status"],row["https_latency_ms"],row["download_MB_s"] = https(ip)
     return row
 
+def num(x):
+    try: return float(x)
+    except (TypeError,ValueError): return None
 
-def render_html(rows, generated_at, https_enabled):
-    columns = [
-        ("IP 地址", "ip"), ("已发送", "sent"), ("已接收", "received"),
-        ("丢包率(%)", "loss_pct"), ("平均延迟(ms)", "avg_latency_ms"),
-        ("下载速度(MB/s)", "download_MB_s"), ("HTTPS 状态", "https_status"),
-        ("HTTPS 延迟(ms)", "https_latency_ms"), ("数据来源", "source")
-    ]
-    header = "".join(f"<th>{html.escape(label)}</th>" for label, _ in columns)
-    body = []
-    for row in rows:
-        cells = "".join(
-            f"<td>{html.escape(str(row.get(key, '')) or 'N/A')}</td>"
-            for _, key in columns
-        )
-        body.append(f"<tr>{cells}</tr>")
-    note = (
-        "HTTPS 与下载测试已启用；结果针对 config.json 中配置的域名。"
-        if https_enabled else
-        "尚未配置测试域名：HTTPS 状态和下载速度为 N/A。TCP 成功不代表 VLESS/WS/TLS 服务可用。"
-    )
-    page = f"""<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cloudflare IP 优选排行榜</title>
-<style>
-body{{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;margin:24px;color:#202124;background:#f7f8fa}}
-h1{{font-size:1.7rem}} .meta{{color:#555}} .note{{padding:12px;background:#fff4d6;border-radius:8px}}
-.wrap{{overflow:auto;background:white;border-radius:10px;margin-top:16px}} table{{border-collapse:collapse;width:100%;white-space:nowrap}}
-th,td{{padding:10px 12px;border-bottom:1px solid #e5e7eb;text-align:left}} th{{background:#eef2f7;position:sticky;top:0}}
-tr:hover{{background:#f5faff}} a{{color:#155eef}} .links{{margin:16px 0}}
-</style></head><body>
-<h1>Cloudflare IP 优选排行榜</h1>
-<p class="meta">生成时间：{html.escape(generated_at)} · 测试地址数量：{len(rows)}</p>
-<p class="note">{html.escape(note)}</p>
-<div class="links"><a href="result.csv">下载 CSV 完整结果</a>　|　<a href="result.txt">下载筛选 IP 列表</a></div>
-<div class="wrap"><table><thead><tr>{header}</tr></thead><tbody>{''.join(body)}</tbody></table></div>
-<p class="meta">GitHub 云端测试不一定代表你的本地网络。测试针对公开 Cloudflare IPv4 范围抽样，不保证任意 IP 适用于特定代理服务。</p>
-</body></html>"""
-    Path("index.html").write_text(page, encoding="utf-8")
+def score(rows):
+    lats=[num(r["median_latency_ms"]) for r in rows if num(r["median_latency_ms"]) is not None]
+    speeds=[num(r["download_MB_s"]) for r in rows if str(r["https_status"]).startswith("2") and num(r["download_MB_s"]) and num(r["download_MB_s"])>0]
+    bestlat=min(lats) if lats else None; bestspeed=max(speeds) if speeds else None
+    for r in rows:
+        lat=num(r["median_latency_ms"]); sp=num(r["download_MB_s"])
+        lc=bestlat/lat if bestlat and lat and lat>0 else 0
+        sc=min(sp/bestspeed,1) if bestspeed and sp and sp>0 and str(r["https_status"]).startswith("2") else 0
+        success=float(r["success_rate_pct"])/100
+        r["score"]=round(40*lc+35*sc+25*success,2) if bestspeed else round((40*lc+25*success)*100/65,2)
 
+def make_html(rows):
+    cols=[("排名","rank"),("综合评分","score"),("IP 地址","ip"),("已发送","sent"),("已接收","received"),("丢包率(%)","loss_pct"),("平均延迟(ms)","avg_latency_ms"),("中位延迟(ms)","median_latency_ms"),("下载速度(MB/s)","download_MB_s"),("HTTPS 状态","https_status"),("HTTPS 耗时(ms)","https_latency_ms"),("数据来源","source")]
+    th="".join(f"<th>{html.escape(a)}</th>" for a,b in cols); trs=[]
+    for i,r in enumerate(rows,1):
+        r["rank"]=i
+        trs.append("<tr>"+"".join(f"<td>{html.escape(str(r.get(k,'')) or 'N/A')}</td>" for a,k in cols)+"</tr>")
+    note="评分权重：TCP 延迟 40%、HTTPS 下载速度 35%、TCP 成功率 25%。" if C.get("test_host") else "未配置 HTTPS 测试，评分仅使用 TCP 延迟和成功率。"
+    page=f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Cloudflare IP 综合排行榜</title><style>body{{font-family:Arial,sans-serif;margin:24px;background:#f7f8fa;color:#202124}}.box{{overflow:auto;background:white}}table{{border-collapse:collapse;white-space:nowrap;width:100%}}th,td{{padding:10px;border-bottom:1px solid #ddd;text-align:left}}th{{background:#eef2f7;position:sticky;top:0}}.note{{padding:12px;background:#fff4d6}}a{{margin-right:16px}}</style></head><body><h1>Cloudflare IP 综合排行榜</h1><p>生成时间：{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} · 候选数：{len(rows)}</p><p class="note">{html.escape(note)}</p><p><a href="result.csv">下载 CSV</a><a href="result.txt">下载优选 IP TXT</a></p><div class="box"><table><thead><tr>{th}</tr></thead><tbody>{''.join(trs)}</tbody></table></div><p>GitHub 云端结果不一定代表本地网络；TCP 443 成功不代表 WebSocket/VLESS 服务可用。</p></body></html>"""
+    Path("index.html").write_text(page,encoding="utf-8")
 
 def main():
-    print("Fetching Cloudflare published IPv4 ranges...")
-    networks = fetch_networks()
-    ips = sample_ips(networks, int(CONFIG.get("max_candidates", 120)))
-    if not ips:
-        raise RuntimeError("No IPv4 candidates were generated.")
-    print(f"Testing {len(ips)} candidate IPs...")
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=int(CONFIG.get("max_workers", 24))
-    ) as pool:
-        rows = list(pool.map(test_ip, ips))
-    rows.sort(key=lambda r: (
-        r["received"] == 0,
-        r["loss_pct"],
-        r["median_latency_ms"] if r["median_latency_ms"] != "" else float("inf")
-    ))
-    fields = [
-        "ip", "sent", "received", "loss_pct", "avg_latency_ms",
-        "median_latency_ms", "min_latency_ms", "download_MB_s",
-        "https_status", "https_latency_ms", "source"
-    ]
-    with open("result.csv", "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
-    max_latency = float(CONFIG.get("max_latency_ms", 300))
-    min_success = float(CONFIG.get("min_success_rate", 0.75))
-    selected = [
-        r for r in rows
-        if r["sent"] and r["received"] / r["sent"] >= min_success
-        and r["median_latency_ms"] != ""
-        and r["median_latency_ms"] <= max_latency
-    ]
-    Path("result.txt").write_text(
-        "".join(r["ip"] + "\n" for r in selected), encoding="utf-8"
-    )
-    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    render_html(rows, generated_at, bool(str(CONFIG.get("test_host", "")).strip()))
+    nets=get_ranges(); ips=sample(nets,int(C.get("max_candidates",120)))
+    if not ips: raise RuntimeError("No IPv4 candidates found")
+    print(f"Testing {len(ips)} candidates")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=int(C.get("max_workers",24))) as ex:
+        rows=list(ex.map(test,ips))
+    score(rows)
+    rows.sort(key=lambda r:(-r["score"],num(r["median_latency_ms"]) if num(r["median_latency_ms"]) is not None else float("inf")))
+    fields=["ip","score","sent","received","loss_pct","success_rate_pct","avg_latency_ms","median_latency_ms","min_latency_ms","download_MB_s","https_status","https_latency_ms","source"]
+    with open("result.csv","w",newline="",encoding="utf-8-sig") as f:
+        w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(rows)
+    minrate=float(C.get("min_success_rate",.8)); maxlat=float(C.get("max_latency_ms",300))
+    selected=[r for r in rows if num(r["median_latency_ms"]) is not None and float(r["success_rate_pct"])/100>=minrate and float(r["median_latency_ms"])<=maxlat and (not C.get("test_host") or (str(r["https_status"]).startswith("2") and num(r["download_MB_s"]) and num(r["download_MB_s"])>0))]
+    Path("result.txt").write_text("".join(r["ip"]+"\n" for r in selected),encoding="utf-8")
+    make_html(rows)
     print(f"Done: {len(rows)} tested; {len(selected)} passed filters.")
 
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()

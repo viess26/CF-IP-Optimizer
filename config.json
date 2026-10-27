@@ -1,12 +1,12 @@
 {
   "port": 443,
   "timeout_seconds": 2.5,
-  "rounds": 4,
+  "rounds": 5,
   "max_workers": 24,
   "max_candidates": 120,
   "max_latency_ms": 300,
-  "min_success_rate": 0.75,
+  "min_success_rate": 0.8,
   "download_test_bytes": 524288,
- "test_host": "speed.cloudflare.com",
-"test_path": "/__down?bytes=524288"
+  "test_host": "speed.cloudflare.com",
+  "test_path": "/__down?bytes=524288"
 }
