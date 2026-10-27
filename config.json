@@ -1,0 +1,12 @@
+{
+  "port": 443,
+  "timeout_seconds": 2.5,
+  "rounds": 4,
+  "max_workers": 24,
+  "max_candidates": 120,
+  "max_latency_ms": 300,
+  "min_success_rate": 0.75,
+  "download_test_bytes": 524288,
+  "test_host": "",
+  "test_path": "/"
+}

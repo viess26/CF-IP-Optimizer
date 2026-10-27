@@ -1,0 +1,1 @@
+ip,sent,received,loss_pct,avg_latency_ms,median_latency_ms,min_latency_ms,download_MB_s,https_status,https_latency_ms,source
